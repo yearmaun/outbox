@@ -8,6 +8,6 @@ require (
 	github.com/rabbitmq/amqp091-go v1.9.0
 )
 
-require github.com/oagudo/outbox v0.0.0-20250512092004-3a273cf600f3
+require github.com/yearmaun/outbox v0.0.0-20250512092004-3a273cf600f3
 
-replace github.com/oagudo/outbox => ../../
+replace github.com/yearmaun/outbox => ../../

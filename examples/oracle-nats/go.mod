@@ -11,10 +11,10 @@ require (
 	github.com/klauspost/compress v1.17.2 // indirect
 	github.com/nats-io/nkeys v0.4.5 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/oagudo/outbox v0.0.0-20250512074227-c5f225433abc
+	github.com/yearmaun/outbox v0.0.0-20250512074227-c5f225433abc
 	github.com/sijms/go-ora/v2 v2.8.24
 	golang.org/x/crypto v0.6.0 // indirect
 	golang.org/x/sys v0.5.0 // indirect
 )
 
-replace github.com/oagudo/outbox => ../../
+replace github.com/yearmaun/outbox => ../../

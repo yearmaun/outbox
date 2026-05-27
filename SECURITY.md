@@ -6,7 +6,7 @@ If you believe you have found a security vulnerability, please report it to me a
 
 ### Reporting Process
 
-To report a security issue, please use the GitHub Security Advisory ["Report a Vulnerability"](https://github.com/oagudo/outbox/security/advisories/new) tab.
+To report a security issue, please use the GitHub Security Advisory ["Report a Vulnerability"](https://github.com/yearmaun/outbox/security/advisories/new) tab.
 
 ### What to Expect
 

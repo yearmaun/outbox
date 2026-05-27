@@ -3,12 +3,12 @@
 </p>
 
 
-[![Release](https://img.shields.io/github/release/oagudo/outbox.svg?style=flat-square)](https://github.com/oagudo/outbox/releases/latest)
+[![Release](https://img.shields.io/github/release/yearmaun/outbox.svg?style=flat-square)](https://github.com/yearmaun/outbox/releases/latest)
 [![Software License](https://img.shields.io/badge/license-MIT-brightgreen.svg?style=flat-square)](LICENSE)
-![GitHub Actions](https://github.com/oagudo/outbox/actions/workflows/ci.yml/badge.svg)
-[![codecov](https://codecov.io/gh/oagudo/outbox/graph/badge.svg?token=KH1GUAV4VR)](https://codecov.io/gh/oagudo/outbox)
-[![Go Report Card](https://goreportcard.com/badge/github.com/oagudo/outbox?style=flat-square)](https://goreportcard.com/report/github.com/oagudo/outbox)
-[![Go Reference](https://pkg.go.dev/badge/github.com/oagudo/outbox.svg)](https://pkg.go.dev/github.com/oagudo/outbox)
+![GitHub Actions](https://github.com/yearmaun/outbox/actions/workflows/ci.yml/badge.svg)
+[![codecov](https://codecov.io/gh/yearmaun/outbox/graph/badge.svg?token=KH1GUAV4VR)](https://codecov.io/gh/yearmaun/outbox)
+[![Go Report Card](https://goreportcard.com/badge/github.com/yearmaun/outbox?style=flat-square)](https://goreportcard.com/report/github.com/yearmaun/outbox)
+[![Go Reference](https://pkg.go.dev/badge/github.com/yearmaun/outbox.svg)](https://pkg.go.dev/github.com/yearmaun/outbox)
 
 Lightweight library for the [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) in Go, not tied to any specific relational database or broker.
 
@@ -369,7 +369,7 @@ You can use `stdlib.OpenDBFromPool` [function](https://pkg.go.dev/github.com/jac
 import (
     "github.com/jackc/pgx/v5/pgxpool"
     "github.com/jackc/pgx/v5/stdlib"
-    "github.com/oagudo/outbox"
+    "github.com/yearmaun/outbox"
 )
 
 // ...
