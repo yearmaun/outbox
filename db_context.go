@@ -178,6 +178,20 @@ func (c *DBContext) buildSelectMessagesQuery() string {
 	}
 }
 
+func (c *DBContext) buildSelectMessagesQueryWithLock() string {
+	// nolint:gosec
+	return fmt.Sprintf(
+		"SELECT id, payload, created_at, scheduled_at, metadata, times_attempted "+
+			"FROM %s "+
+			"WHERE scheduled_at <= NOW() "+
+			"ORDER BY scheduled_at ASC "+
+			"LIMIT %s "+
+			"FOR UPDATE SKIP LOCKED",
+		c.tableName,
+		c.getSQLPlaceholder(1),
+	)
+}
+
 // txAdapter is a wrapper around a sql.Tx that implements the Tx interface.
 type txAdapter struct {
 	tx *sql.Tx

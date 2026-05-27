@@ -349,45 +349,6 @@ func (e *ReadError) Error() string { return fmt.Sprintf("reading outbox messages
 
 func (e *ReadError) Unwrap() error { return e.Err }
 
-// Errors returns a channel that receives errors from the outbox reader.
-// The channel is buffered to prevent blocking the reader. If the buffer becomes
-// full, subsequent errors will be dropped to maintain reader throughput.
-// The channel is closed when the reader is stopped.
-//
-// The returned error will be one of the following types, which can be checked
-// using a type switch:
-//   - *PublishError: Failed to publish a message. Contains the message.
-//   - *UpdateError:  Failed to update a message after a failed publish attempt.
-//     Contains the message.
-//   - *DeleteError:  Failed to delete a batch of messages. Contains the messages.
-//   - *ReadError:    Failed to read messages from the outbox.
-//
-// Example of error handling:
-//
-//	for err := range r.Errors() {
-//		switch e := err.(type) {
-//		case *outbox.PublishError:
-//			log.Printf("Failed to publish message | ID: %s | Error: %v",
-//				e.Message.ID, e.Err)
-//
-//		case *outbox.UpdateError:
-//			log.Printf("Failed to update message | ID: %s | Error: %v",
-//				e.Message.ID, e.Err)
-//
-//		case *outbox.DeleteError:
-//			log.Printf("Batch message deletion failed | Count: %d | Error: %v",
-//				len(e.Messages), e.Err)
-//			for _, msg := range e.Messages {
-//				log.Printf("Failed to delete message | ID: %s", msg.ID)
-//			}
-//
-//		case *outbox.ReadError:
-//			log.Printf("Failed to read outbox messages | Error: %v", e.Err)
-//
-//		default:
-//			log.Printf("Unexpected error occurred | Error: %v", e)
-//		}
-//	}
 func (r *Reader) Errors() <-chan error {
 	return r.errCh
 }
@@ -418,7 +379,23 @@ func (r *Reader) sendDiscardedMessage(msg *Message) {
 }
 
 func (r *Reader) publishMessages() {
-	msgs, err := r.readOutboxMessages()
+	// Начинаем транзакцию
+	ctx, cancel := context.WithTimeout(r.ctx, r.publishTimeout)
+	defer cancel()
+
+	tx, err := r.dbCtx.db.BeginTx(ctx, nil)
+	if err != nil {
+		r.sendError(&ReadError{Err: fmt.Errorf("begin transaction: %w", err)})
+		return
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Читаем сообщения с блокировкой
+	msgs, err := r.readOutboxMessagesWithLock(ctx, tx)
 	if err != nil {
 		r.sendError(&ReadError{Err: err})
 		return
@@ -427,19 +404,26 @@ func (r *Reader) publishMessages() {
 	msgsToDelete := make([]*Message, 0, r.deleteBatchSize)
 
 	for _, msg := range msgs {
-		if r.handleMessage(msg) {
+		if r.handleMessageInTx(ctx, tx, msg) {
 			msgsToDelete = append(msgsToDelete, msg)
 		}
 
-		if r.flushIfFull(msgsToDelete) {
+		if r.flushIfFullInTx(ctx, tx, msgsToDelete) {
 			msgsToDelete = make([]*Message, 0, r.deleteBatchSize)
 		}
 	}
 
-	// delete remaining messages as next tick would read them again otherwise
-	err = r.deleteMessages(msgsToDelete)
+	// Удаляем оставшиеся сообщения
+	err = r.deleteMessagesInTx(ctx, tx, msgsToDelete)
 	if err != nil {
 		r.sendError(&DeleteError{Messages: copyMessages(msgsToDelete), Err: err})
+		return
+	}
+
+	// Коммитим транзакцию
+	err = tx.Commit()
+	if err != nil {
+		r.sendError(&ReadError{Err: fmt.Errorf("commit transaction: %w", err)})
 	}
 }
 
@@ -456,6 +440,19 @@ func (r *Reader) flushIfFull(msgsToDelete []*Message) bool {
 		return false
 	}
 	err := r.deleteMessages(msgsToDelete)
+	if err != nil {
+		r.sendError(&DeleteError{Messages: copyMessages(msgsToDelete), Err: err})
+		return false
+	}
+
+	return true
+}
+
+func (r *Reader) flushIfFullInTx(ctx context.Context, tx Tx, msgsToDelete []*Message) bool {
+	if len(msgsToDelete) < r.deleteBatchSize {
+		return false
+	}
+	err := r.deleteMessagesInTx(ctx, tx, msgsToDelete)
 	if err != nil {
 		r.sendError(&DeleteError{Messages: copyMessages(msgsToDelete), Err: err})
 		return false
@@ -491,6 +488,34 @@ func (r *Reader) handleMessage(msg *Message) bool {
 	return true
 }
 
+func (r *Reader) handleMessageInTx(ctx context.Context, tx Tx, msg *Message) bool {
+	// db clock used in the query is ahead of the reader clock, skip the message
+	if msg.ScheduledAt.After(time.Now().UTC()) {
+		return false
+	}
+
+	if msg.TimesAttempted >= r.maxAttempts {
+		r.sendDiscardedMessage(msg)
+		return true // mark for deletion
+	}
+
+	// Публикуем сообщение (это внешний вызов, не в транзакции БД)
+	err := r.publishMessage(msg)
+	if err != nil {
+		msg.TimesAttempted++
+
+		r.sendError(&PublishError{Message: *msg, Err: err})
+
+		err = r.scheduleNextAttemptInTx(ctx, tx, msg)
+		if err != nil {
+			r.sendError(&UpdateError{Message: *msg, Err: err})
+		}
+		return false
+	}
+
+	return true
+}
+
 func (r *Reader) scheduleNextAttempt(msg *Message) error {
 	ctx, cancel := context.WithTimeout(r.ctx, r.updateTimeout)
 	defer cancel()
@@ -503,6 +528,22 @@ func (r *Reader) scheduleNextAttempt(msg *Message) error {
 	query := fmt.Sprintf("UPDATE %s SET times_attempted = times_attempted + 1, scheduled_at = %s WHERE id = %s",
 		r.dbCtx.tableName, r.dbCtx.getSQLPlaceholder(1), r.dbCtx.getSQLPlaceholder(2))
 	_, err := r.dbCtx.db.ExecContext(ctx, query, nextScheduledAt, r.dbCtx.formatMessageIDForDB(msg))
+	if err != nil {
+		return fmt.Errorf("scheduling next attempt for message %s: %w", msg.ID, err)
+	}
+
+	return nil
+}
+
+func (r *Reader) scheduleNextAttemptInTx(ctx context.Context, tx Tx, msg *Message) error {
+	// TimesAttempted already reflects the current attempt, so subtract 1 to get the 0-indexed retry number
+	delay := r.delayFunc(int(msg.TimesAttempted) - 1)
+	nextScheduledAt := time.Now().UTC().Add(delay)
+
+	// nolint:gosec // Query built with placeholders ($1,$2..), not actual values
+	query := fmt.Sprintf("UPDATE %s SET times_attempted = times_attempted + 1, scheduled_at = %s WHERE id = %s",
+		r.dbCtx.tableName, r.dbCtx.getSQLPlaceholder(1), r.dbCtx.getSQLPlaceholder(2))
+	_, err := tx.ExecContext(ctx, query, nextScheduledAt, r.dbCtx.formatMessageIDForDB(msg))
 	if err != nil {
 		return fmt.Errorf("scheduling next attempt for message %s: %w", msg.ID, err)
 	}
@@ -539,6 +580,24 @@ func (r *Reader) deleteMessages(msgsToDelete []*Message) error {
 	return err
 }
 
+func (r *Reader) deleteMessagesInTx(ctx context.Context, tx Tx, msgsToDelete []*Message) error {
+	if len(msgsToDelete) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, 0, len(msgsToDelete))
+	ids := make([]any, 0, len(msgsToDelete))
+	for idx, msg := range msgsToDelete {
+		placeholders = append(placeholders, r.dbCtx.getSQLPlaceholder(idx+1))
+		ids = append(ids, r.dbCtx.formatMessageIDForDB(msg))
+	}
+	// nolint:gosec // Query built with placeholders ($1,$2..), not actual values
+	query := fmt.Sprintf("DELETE FROM %s WHERE id IN (%s)", r.dbCtx.tableName, strings.Join(placeholders, ", "))
+	_, err := tx.ExecContext(ctx, query, ids...)
+
+	return err
+}
+
 func (r *Reader) readOutboxMessages() ([]*Message, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, r.readTimeout)
 	defer cancel()
@@ -548,6 +607,31 @@ func (r *Reader) readOutboxMessages() ([]*Message, error) {
 	rows, err := r.dbCtx.db.QueryContext(ctx, query, r.maxMessages)
 	if err != nil {
 		return nil, fmt.Errorf("querying outbox messages: %w", err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	var messages []*Message
+	for rows.Next() {
+		msg := &Message{}
+		if err := rows.Scan(&msg.ID, &msg.Payload, &msg.CreatedAt, &msg.ScheduledAt, &msg.Metadata, &msg.TimesAttempted); err != nil {
+			return nil, fmt.Errorf("scanning outbox message: %w", err)
+		}
+		messages = append(messages, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating outbox messages: %w", err)
+	}
+	return messages, nil
+}
+
+func (r *Reader) readOutboxMessagesWithLock(ctx context.Context, tx Tx) ([]*Message, error) {
+	// nolint:gosec // Query built with SQL functions and placeholders, not user data
+	query := r.dbCtx.buildSelectMessagesQueryWithLock() // Добавляем FOR UPDATE SKIP LOCKED
+	rows, err := tx.QueryContext(ctx, query, r.maxMessages)
+	if err != nil {
+		return nil, fmt.Errorf("querying outbox messages with lock: %w", err)
 	}
 	defer func() {
 		_ = rows.Close()
