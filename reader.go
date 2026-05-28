@@ -379,8 +379,10 @@ func (r *Reader) sendDiscardedMessage(msg *Message) {
 }
 
 func (r *Reader) publishMessages() {
-	// Начинаем транзакцию
-	ctx, cancel := context.WithTimeout(r.ctx, r.publishTimeout)
+	// Таймаут на всю операцию = read + publish * N + delete
+	// Считаем честно, не используем publishTimeout повторно
+	totalTimeout := r.readTimeout + time.Duration(r.maxMessages)*r.publishTimeout + r.deleteTimeout
+	ctx, cancel := context.WithTimeout(r.ctx, totalTimeout)
 	defer cancel()
 
 	tx, err := r.dbCtx.db.BeginTx(ctx, nil)
@@ -388,42 +390,36 @@ func (r *Reader) publishMessages() {
 		r.sendError(&ReadError{Err: fmt.Errorf("begin transaction: %w", err)})
 		return
 	}
+
 	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
+		_ = tx.Rollback()
 	}()
 
-	// Читаем сообщения с блокировкой
 	msgs, err := r.readOutboxMessagesWithLock(ctx, tx)
 	if err != nil {
 		r.sendError(&ReadError{Err: err})
 		return
 	}
 
-	msgsToDelete := make([]*Message, 0, r.deleteBatchSize)
-
+	msgsToDelete := make([]*Message, 0, len(msgs))
 	for _, msg := range msgs {
 		if r.handleMessageInTx(ctx, tx, msg) {
 			msgsToDelete = append(msgsToDelete, msg)
 		}
-
-		if r.flushIfFullInTx(ctx, tx, msgsToDelete) {
-			msgsToDelete = make([]*Message, 0, r.deleteBatchSize)
-		}
 	}
 
-	// Удаляем оставшиеся сообщения
-	err = r.deleteMessagesInTx(ctx, tx, msgsToDelete)
-	if err != nil {
+	// Удаляем с context.Background() — опубликованное обязаны удалить
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), r.deleteTimeout)
+	defer deleteCancel()
+
+	if err := r.deleteMessagesInTx(deleteCtx, tx, msgsToDelete); err != nil {
 		r.sendError(&DeleteError{Messages: copyMessages(msgsToDelete), Err: err})
 		return
 	}
 
-	// Коммитим транзакцию
-	err = tx.Commit()
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		r.sendError(&ReadError{Err: fmt.Errorf("commit transaction: %w", err)})
+		return
 	}
 }
 
@@ -461,54 +457,23 @@ func (r *Reader) flushIfFullInTx(ctx context.Context, tx Tx, msgsToDelete []*Mes
 	return true
 }
 
-func (r *Reader) handleMessage(msg *Message) bool {
-	// db clock used in the query is ahead of the reader clock, skip the message
-	if msg.ScheduledAt.After(time.Now().UTC()) {
-		return false
-	}
-
-	if msg.TimesAttempted >= r.maxAttempts {
-		r.sendDiscardedMessage(msg)
-		return true // mark for deletion
-	}
-
-	err := r.publishMessage(msg)
-	if err != nil {
-		msg.TimesAttempted++
-
-		r.sendError(&PublishError{Message: *msg, Err: err})
-
-		err = r.scheduleNextAttempt(msg)
-		if err != nil {
-			r.sendError(&UpdateError{Message: *msg, Err: err})
-		}
-		return false
-	}
-
-	return true
-}
-
 func (r *Reader) handleMessageInTx(ctx context.Context, tx Tx, msg *Message) bool {
-	// db clock used in the query is ahead of the reader clock, skip the message
 	if msg.ScheduledAt.After(time.Now().UTC()) {
 		return false
 	}
 
 	if msg.TimesAttempted >= r.maxAttempts {
 		r.sendDiscardedMessage(msg)
-		return true // mark for deletion
+		return true
 	}
 
-	// Публикуем сообщение (это внешний вызов, не в транзакции БД)
-	err := r.publishMessage(msg)
+	err := r.publishMessage(ctx, msg) // ← пробрасываем ctx
 	if err != nil {
 		msg.TimesAttempted++
-
 		r.sendError(&PublishError{Message: *msg, Err: err})
 
-		err = r.scheduleNextAttemptInTx(ctx, tx, msg)
-		if err != nil {
-			r.sendError(&UpdateError{Message: *msg, Err: err})
+		if schedErr := r.scheduleNextAttemptInTx(ctx, tx, msg); schedErr != nil {
+			r.sendError(&UpdateError{Message: *msg, Err: schedErr})
 		}
 		return false
 	}
@@ -551,11 +516,10 @@ func (r *Reader) scheduleNextAttemptInTx(ctx context.Context, tx Tx, msg *Messag
 	return nil
 }
 
-func (r *Reader) publishMessage(msg *Message) error {
-	ctx, cancel := context.WithTimeout(r.ctx, r.publishTimeout)
+func (r *Reader) publishMessage(ctx context.Context, msg *Message) error {
+	publishCtx, cancel := context.WithTimeout(ctx, r.publishTimeout)
 	defer cancel()
-
-	return r.msgPublisher.Publish(ctx, msg)
+	return r.msgPublisher.Publish(publishCtx, msg)
 }
 
 func (r *Reader) deleteMessages(msgsToDelete []*Message) error {
